@@ -587,24 +587,10 @@ _ZSTD_RESOLVED = False
 
 
 def _zstd_decoder():
-    """The first zstd inflater this machine offers, cheapest first, or None.
-
-    Nothing is assumed about the host, because the hosts differ. The Plow
-    OpenClaw image is Python 3.11 with no pip, no `zstandard` and no
-    `compression.zstd` -- but libzstd.so.1 is already in /lib as a base-image
-    dependency, and Node ships zstd in zlib. Picking one decoder would mean
-    installing a package into a container that holds a live credential; the
-    chain needs nothing installed anywhere, and keeps working if the base image
-    changes underneath it."""
+    """Use Python's standard-library decoder, or the image's existing libzstd."""
     try:                                    # 3.14+, the standard library
         from compression import zstd
         return lambda blob, hint: zstd.decompress(blob)
-    except Exception:
-        pass
-    try:                                    # the package, where somebody has it
-        import zstandard
-        return lambda blob, hint: zstandard.ZstdDecompressor().decompress(
-            blob, max_output_size=int(hint) if hint else 0)
     except Exception:
         pass
     try:                                    # the library itself: no package
@@ -621,15 +607,10 @@ def _zstd_decoder():
         lib.ZSTD_getFrameContentSize.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
 
         def inflate(blob, hint):
-            # The frame header carries the uncompressed length and costs nothing
-            # to read; `event_utf8_bytes` is the same number off the row. Take
-            # the frame, fall back to the column, guess only if neither says --
-            # a buffer shorter than the event would truncate it rather than fail
-            # it, and a truncated event reads as "no usage here", which is the
-            # bug this is fixing.
+            # Schema 23 supplies the original size when the frame omits it.
             size = lib.ZSTD_getFrameContentSize(blob, len(blob))
             if size in _ZSTD_NO_SIZE or size == 0:
-                size = int(hint) if hint else max(len(blob) * 16, 1 << 16)
+                size = int(hint)
             buf = ctypes.create_string_buffer(int(size))
             read = lib.ZSTD_decompress(buf, int(size), blob, len(blob))
             if lib.ZSTD_isError(read):
@@ -641,21 +622,6 @@ def _zstd_decoder():
         # discovered mid-report rather than here. This frame is `{}`.
         assert inflate(b"\x28\xb5\x2f\xfd\x20\x02\x11\x00\x00\x7b\x7d", 2) == "{}"
         return inflate
-    except Exception:
-        pass
-    try:                                    # node: one process per event
-        script = ("const z=require('zlib'),c=[];process.stdin.on('data',d=>c.push(d))"
-                  ".on('end',()=>process.stdout.write(z.zstdDecompressSync(Buffer.concat(c))));")
-        subprocess.run(["node", "-e", "require('zlib').zstdDecompressSync"],
-                       check=True, capture_output=True)
-
-        def shell_out(blob, hint):
-            done = subprocess.run(["node", "-e", script], input=blob, capture_output=True)
-            if done.returncode != 0:
-                raise RuntimeError((done.stderr or b"").decode()[:200] or "node zstd failed")
-            return done.stdout.decode("utf-8")
-
-        return shell_out
     except Exception:
         pass
     return None
@@ -681,7 +647,7 @@ def _event_json(raw, blob, utf8_bytes):
         _ZSTD, _ZSTD_RESOLVED = _zstd_decoder(), True
     if _ZSTD is None:
         raise RuntimeError("no zstd decoder on this machine (wanted compression.zstd, "
-                           "the zstandard package, libzstd.so.1, or node)")
+                           "or libzstd)")
     return _ZSTD(blob, utf8_bytes)
 
 
